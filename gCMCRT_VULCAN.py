@@ -6,8 +6,7 @@
 from random import seed
 from random import random
 import numpy as np
-from numba import jit, config
-from numba import int32, float64
+from numba import jit, config, int32, float64
 from numba.experimental import jitclass
 
 config.DISABLE_JIT = False
@@ -41,7 +40,7 @@ class pac:
     self.tau = tau
     self.iscat = iscat
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=False)
 def tauint_1D_pp(ph, nlay, z, rhokap, Jdot):
 
   ph.tau = 0.0
@@ -98,7 +97,7 @@ def tauint_1D_pp(ph, nlay, z, rhokap, Jdot):
 
   return
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=False)
 def inc_stellar(ph, nlay, z, mu_z):
 
   ph.cost = -mu_z
@@ -108,7 +107,7 @@ def inc_stellar(ph, nlay, z, mu_z):
 
   return
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=False)
 def scatter(ph, g):
 
   if (ph.iscat == 1):
@@ -181,7 +180,7 @@ def scatter(ph, g):
 
   return
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=False, parallel=False)
 def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z):
   
   # We need to get sent the number of layers, wavelengths, cross sections, Rayleigh cross sections, 
@@ -189,7 +188,7 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, n
 
   # We index from 0 starting from the bottom boundary 
 
-  Nph = 100000
+  Nph = 10000
 
   nlev = nlay + 1
 
@@ -357,6 +356,8 @@ Jdot = np.zeros((nwl, nlay))
 
 J_mean, Jdot, Idirr = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z)
 
+quit()
+
 print(J_mean[-1],Iinc[0], J_mean[-1]/Iinc[0], 1.0/mu_z)
 #print(J_mean[:]/Iinc[0])
 
@@ -369,7 +370,6 @@ J_mean_2, Jdot, Idirr = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_
 
 print(J_mean_2[:])
 
-quit()
 
 import matplotlib.pylab as plt
 
