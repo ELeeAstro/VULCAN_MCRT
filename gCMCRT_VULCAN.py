@@ -6,23 +6,42 @@
 from random import seed
 from random import random
 import numpy as np
+from numba import jit, config
+from numba import int32, float64
+from numba.experimental import jitclass
 
+config.DISABLE_JIT = False
+
+pac_def = [
+    ('flag', int32),      
+    ('id', int32),
+    ('iseed', int32),
+    ('e0dt', float64),
+    ('cost', float64),
+    ('nzp', float64),
+    ('zc', int32),
+    ('zp', float64),
+    ('tau_p', float64),
+    ('tau', float64),
+    ('iscat',int32)
+]
+
+@jitclass(pac_def)
 class pac:
-  def __init__(self, flag, id, iseed, e0dt):
+  def __init__(self, flag, id, iseed, e0dt, cost, nzp, zc, zp, tau_p, tau, iscat):
     self.flag = flag
     self.id = id
     self.iseed = iseed
     self.e0dt = e0dt
+    self.cost = cost
+    self.nzp = nzp
+    self.zc = zc
+    self.zp = zp
+    self.tau_p = tau_p
+    self.tau = tau
+    self.iscat = iscat
 
-  cost = None
-  nzp = None
-  zc = None
-  zp = None
-  tau_p = None
-  tau = None
-  iscat = None
-
-
+@jit(nopython=True, cache=True)
 def tauint_1D_pp(ph, nlay, z, rhokap, Jdot):
 
   ph.tau = 0.0
@@ -54,19 +73,20 @@ def tauint_1D_pp(ph, nlay, z, rhokap, Jdot):
 
       # Update estimator
       Jdot[ph.zc] += d1 * ph.e0dt
+      #Jdot[ph.zc] += d1*ph.nzp * ph.e0dt
 
       ph.tau = ph.tau_p
     else:
       #Packet continues to level edge - update position, cell index and tau
-      ph.zp += (dsz + 1.0e-6) * ph.nzp
+      ph.zp += (dsz + 1.0e-12) * ph.nzp
 
       # Update estimator
       Jdot[ph.zc] += dsz * ph.e0dt
+      #Jdot[ph.zc] += dsz*ph.nzp * ph.e0dt
 
       ph.zc += zoffset
 
       ph.tau += taucell
-
 
       #Check is packet has exited the domain
       if ((ph.zc > nlay-1) or (ph.zp >= z[-1])):
@@ -78,15 +98,17 @@ def tauint_1D_pp(ph, nlay, z, rhokap, Jdot):
 
   return
 
+@jit(nopython=True, cache=True)
 def inc_stellar(ph, nlay, z, mu_z):
 
   ph.cost = -mu_z
   ph.nzp = ph.cost
   ph.zc = nlay-1
-  ph.zp = z[-1] - 1.0e-6
+  ph.zp = z[-1] - 1.0e-12
 
   return
 
+@jit(nopython=True, cache=True)
 def scatter(ph, g):
 
   if (ph.iscat == 1):
@@ -159,6 +181,7 @@ def scatter(ph, g):
 
   return
 
+@jit(nopython=True, cache=True)
 def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z):
   
   # We need to get sent the number of layers, wavelengths, cross sections, Rayleigh cross sections, 
@@ -166,7 +189,7 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, n
 
   # We index from 0 starting from the bottom boundary 
 
-  Nph = 10000
+  Nph = 100000
 
   nlev = nlay + 1
 
@@ -192,13 +215,13 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, n
     for i in range(n_cross):
       k_ext[:] += VMR_cross[i,:] * cross[i,l,:]
     
-    k_ext[:] = k_ext[:] * nd[:]/rho[:] 
+    k_ext[:] *= nd[:]/rho[:] 
 
     # Find the total rayleigh opacity from Rayleigh species cross sections
     for i in range(n_ray):
       k_sca[:] += VMR_ray[i,:] * ray[i,l,:]
 
-    k_sca[:] = k_sca[:] * nd[:]/rho[:] 
+    k_sca[:] *= nd[:]/rho[:] 
 
     # Extinction = photocross + Rayleigh
     k_ext[:] = k_ext[:] + k_sca[:]
@@ -217,15 +240,30 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, n
     for k in range(nlay-1,-1,-1):
       tau[k] = tau[k+1] + rhokap[k] * dze[k]
 
+    ## Calculate direct beam for testing
+    Idirr = np.zeros(nlev)
+    Idirr[:] = Iinc[l] * np.exp(-tau[:]/mu_z)
+
+    seed(l)
+
     for n in range(Nph):
 
+      # Initialise packet variables (janky python way)
       flag = 0
       id = l*Nph + n
       iseed = id
-      seed(int(iseed))
-      e0dt = Iinc[l]/float(Nph)
-      ph = pac(flag, id, iseed, e0dt)
-      ph.iscat = 2
+      e0dt = mu_z * Iinc[l]/float(Nph)
+      iscat = 2
+
+      # Initialise junk packet variables (just make sure for correct type)
+      cost = 0.0
+      nzp = 0.0
+      zc = 0
+      zp = 0.0
+      tau_p = 0.0
+      itau = 0.0
+
+      ph = pac(flag, id, iseed, e0dt, cost, nzp, zc, zp, tau_p, itau, iscat)
 
       inc_stellar(ph, nlay, z, mu_z)
 
@@ -247,7 +285,7 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, n
           break
 
     # Scale estimator to dze and divide by four pi
-    Jdot[l,:] = Jdot[l,:]/dze[:]/(4.0 * np.pi)
+    Jdot[l,:] = Jdot[l,:]/dze[:]
 
 
   # After all loops, integrate to find k for each cross section species and find integrated mean intensity
@@ -255,7 +293,7 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, n
   #  J_mean[k] = np.trapz(Jdot[:,l], wl[:]) 
   J_mean[:] = Jdot[0,:]
 
-  return J_mean, Jdot
+  return J_mean, Jdot, Idirr
 
 ## Mini testing code ##
 
@@ -291,13 +329,13 @@ for i in range(nlay):
 sb_c = 5.670374419e-5
 kb = 1.380649e-16
 Tirr = 1000.0
-Iinc[:] = mu_z * sb_c * Tirr**4
+Iinc[:] = sb_c * Tirr**4
 
 grav_const = 1000.0
 Rd_gas = 3.5568e7
 
 Tl = np.zeros(nlay)
-Tl[:] = 800.0
+Tl[:] = 1000.0
 z = np.zeros(nlev)
 
 rho[:] = pl[:]/(Rd_gas * Tl[:])
@@ -313,25 +351,31 @@ z[0] = 0.0
 for i in range(nlay):
   z[i+1] = z[i] + Rd_gas/grav_const * Tl[i] * np.log(pe[i]/pe[i+1])
 
+
 J_mean = np.zeros(nlay)
 Jdot = np.zeros((nwl, nlay))
 
-J_mean, Jdot = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z)
+J_mean, Jdot, Idirr = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z)
 
-print(J_mean[:])
+print(J_mean[-1],Iinc[0], J_mean[-1]/Iinc[0], 1.0/mu_z)
+#print(J_mean[:]/Iinc[0])
 
 J_mean_2 = np.zeros(nlay)
 
 VMR_ray[:,:] = 1.0
 ray[0,0,:] = 0.9999*cross[0,0,:]
 
-J_mean_2, Jdot = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z)
+J_mean_2, Jdot, Idirr = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, nd, rho, Iinc, mu_z, z)
 
 print(J_mean_2[:])
+
+quit()
 
 import matplotlib.pylab as plt
 
 fig = plt.figure()
+
+plt.plot(Idirr, pe/1e6, label='Direct Beam',ls='dashed',c='black')
 
 plt.plot(J_mean, pl/1e6, label='alb = 0')
 
@@ -339,6 +383,8 @@ plt.plot(J_mean_2, pl/1e6, label='alb = 0.9999, , Ray')
 
 plt.yscale('log')
 plt.xscale('log')
+
+plt.xlim(1e3,1e8)
 
 plt.gca().invert_yaxis()
 
