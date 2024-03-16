@@ -20,7 +20,7 @@ pac_def = [
     ('zp', float64),
     ('tau_p', float64),
     ('tau', float64),
-    ('iscat',int32)
+    ('iscat',int32),
 ]
 
 @jitclass(pac_def)
@@ -103,57 +103,50 @@ def inc_stellar(ph, nlay, z, mu_z):
 
   return
 
-
-@jit(nopython=True, cache=True)
-def scatter_surf(ph, z):
-    
-    ph.cost = np.sqrt(random())
-    ph.nzp = ph.cost
-    ph.zp = z[0] + 1.0e-12
-    ph.zc = 0
-
-    return
-
 @jit(nopython=True, cache=True)
 def scatter(ph, g):
 
-  if (ph.iscat == 1):
-    # Isotropic scattering
-    ph.cost = 2.0 * random() - 1.0
-    ph.nzp = ph.cost
-    return
-  
-  elif (ph.iscat == 2):
-    # Rayleigh scattering via direct spherical coordinate sampling
-    # Assumes non-polarised incident packet
-    q = 4.0*random() - 2.0
-    u = (-q + np.sqrt(1.0 + q**2))**(1.0/3.0)
-    bmu = u - 1.0/u
 
-  elif (ph.iscat == 3):
-    # Sample from single HG function
-    if (g != 0.0):
-      hgg = g
-      g2 = hgg**2
+  match ph.iscat:
 
-      bmu = ((1.0 + g2) - \
-        ((1.0 - g2) / (1.0 - hgg + 2.0 * hgg * random()))**2) \
-        / (2.0*hgg)
-    else:
-      # g = 0, Isotropic scattering
+    case 1:
+      # Isotropic scattering
       ph.cost = 2.0 * random() - 1.0
       ph.nzp = ph.cost
       return
+    
+    case 2:
+      # Rayleigh scattering via direct spherical coordinate sampling
+      # Assumes non-polarised incident packet
+      q = 4.0*random() - 2.0
+      u = (-q + np.sqrt(1.0 + q**2))**(1.0/3.0)
+      bmu = u - 1.0/u
 
+    case 3:
+      # Sample from single HG function
+      if (g != 0.0):
+        hgg = g
+        g2 = hgg**2
+
+        bmu = ((1.0 + g2) - \
+          ((1.0 - g2) / (1.0 - hgg + 2.0 * hgg * random()))**2) \
+          / (2.0*hgg)
+      else:
+        # g = 0, Isotropic scattering
+        ph.cost = 2.0 * random() - 1.0
+        ph.nzp = ph.cost
+        return
+      
+    case _ :
+      # Invalid iscat value
+      print('Invalid iscat chosen: ' + str(ph.iscat) + ' doing isotropic')
+      ph.cost = 2.0 * random() - 1.0
+      ph.nzp = ph.cost
+      return
+    
   # Now apply rotation if non-isotropic scattering
   # Change direction of packet given by sampled direction
-
-  # avoid rare numerical issues with sampling bmu
-  if (bmu > 1.0):
-    bmu = 1.0
-  elif (bmu < -1.0):
-    bmu = -1.0
-
+ 
   # Calculate change in direction in grid reference frame
   if (bmu >= 1.0):
     # Packet directly forward scatters - no change in direction
@@ -188,7 +181,7 @@ def scatter(ph, g):
   return
 
 @jit(nopython=True, cache=True, parallel=False)
-def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, surf_alb, nd, Iinc, mu_z, z):
+def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z):
   
   # We need to get sent the number of layers, wavelengths, cross sections, Rayleigh cross sections, 
   # atmospheric density, incident intensity TOA, altitude, zenith angle
@@ -208,7 +201,6 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
   sig_ext = np.zeros(nlay)
   sig_sca = np.zeros(nlay)
   alb = np.zeros(nlay)
-  g = np.zeros((nwl,nlay))
   Jdot = np.zeros((nwl,nlay))
   J_mean = np.zeros(nlay)
 
@@ -251,25 +243,17 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
       # Initialise packet variables (janky python way)
       flag = 0
       id = l*Nph + n
-      iscat = 2
-
-      # Initialise junk packet variables (just make sure for correct type)
-      cost = 0.0
-      nzp = 0.0
-      zc = 0
-      zp = 0.0
-      tau_p = 0.0
-      itau = 0.0
+      iscat = 3
 
       # Initialise photon packet with initial values
-      ph = pac(flag, id, cost, nzp, zc, zp, tau_p, itau, iscat)
+      ph = pac(flag, id, 0.0, 0.0, 0, 0.0, 0.0, 0.0, iscat)
 
       # Place photon at top of atmosphere with negative zenith angle
       inc_stellar(ph, nlay, z, mu_z)
 
       # Scattering loop
       while(ph.flag == 0):
-        
+
         # Sample a random optical depth of the photon
         ph.tau_p = -np.log(random())
 
@@ -277,25 +261,24 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
         tauint_1D_pp(ph, nlay, z, sig_ext, Jdot[l,:])
 
         # Check status of the photon after moving
-        if (ph.flag == 1):
-          # Exited top (1), exit loop
-          break
-        elif (ph.flag == -2):
-          # Photon hit surface (-2), test surface albedo 
-          if (random() < surf_alb[l]):
-            # Lambertian scatter
-            scatter_surf(ph, z)
-          else:
+        match ph.flag:
+          case 1:
+            # Photon exited top of atmosphere, exit loop
+            break
+          case -2: 
             # Photon was absorbed by surface, exit loop
             break
-
-        # Photon still in grid, test atmospheric albedo
-        if (random() < alb[ph.zc]):
-          # Packet get scattered into new direction
-          scatter(ph, g[l,ph.zc])
-        else:
-          # Packet was absorbed, exit loop
-          break
+          case 0:
+            # Photon still in grid, test atmospheric albedo
+            if (random() < alb[ph.zc]):
+              # Packet get scattered into new direction
+              scatter(ph, g[l,ph.zc])
+            else:
+              # Packet was absorbed, exit loop
+              break
+          case _:
+            # Photon has an invalid flag, raise error
+            print(str(ph.id) + ' has invalid flag: ' + str(ph.flag))
 
     # Scale estimator to dze
     Jdot[l,:] = (e0dt*Jdot[l,:])/dze[:]
@@ -306,7 +289,50 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
   #  J_mean[k] = np.trapz(Jdot[:,l], wl[:]) 
   J_mean[:] = Jdot[0,:]
 
-  return J_mean, Jdot, Idirr
+  return J_mean, Jdot, Idirr, tau
+
+###
+
+# Possible future function updates for code
+
+# @jit(nopython=True, cache=True)
+# def scatter_surf(ph, z):
+    
+#     ph.cost = np.sqrt(random())
+#     ph.nzp = ph.cost
+#     ph.zp = z[0] + 1.0e-12
+#     ph.zc = 0
+
+#     return
+
+###
+
+###
+
+# @jit(nopython=True, cache=True)
+# def path_stretch(ph, mu_z, tau):
+  
+#   chi = 0.0
+
+#   if (random() < chi):
+
+#     tau_path = tau[0]/mu_z # Direct beam optical depth to surface
+
+#     alpha = 1.0/(1.0 + tau_path)
+
+#     ph.tau_p = -np.log(random()/alpha)/alpha
+
+#   else:
+
+#     ph.tau_p = -np.log(random())
+
+
+#   ph.w *= 1.0/((1.0 - chi) + chi*alpha*np.exp((1.0 - alpha) * ph.tau_p))
+#   ph.first = 0
+
+#   return
+
+###
 
 ## Mini testing code ##
 
@@ -328,7 +354,7 @@ surf_alb = np.zeros(nwl)
 
 
 mu_z = 0.577
-k_v = 4e-3
+k_v = 4e-4
 p_up = 1e-9
 p_bot = 1000.0
 
@@ -366,30 +392,34 @@ z[0] = 0.0
 for i in range(nlay):
   z[i+1] = z[i] + Rd_gas/grav_const * Tl[i] * np.log(pe[i]/pe[i+1])
 
-g[:,:] = 0.0
+g[:,:] = 0.9
 
 J_mean_1 = np.zeros(nlay)
 Jdot = np.zeros((nwl, nlay))
 
-J_mean_1, Jdot, Idirr = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, surf_alb, nd, Iinc, mu_z, z)
+tau = np.zeros(nlev)
+
+J_mean_1, Jdot, Idirr, tau, = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z)
 
 
 VMR_ray[:,:] = 1.0
-ray[0,0,:] = 0.5*cross[0,0,:]
+ray[0,0,:] = 0.9*cross[0,0,:]
 cross[0,0,:] = cross[0,0,:] - ray[0,0,:]
 
 J_mean_2 = np.zeros(nlay)
-J_mean_2, Jdot, Idirr = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, surf_alb, nd, Iinc, mu_z, z)
+J_mean_2, Jdot, Idirr, tau, = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z)
 
 
 import matplotlib.pylab as plt
 
 fig = plt.figure()
 
-plt.plot(Idirr, pe/1e6, label='Direct Beam',ls='dashed',c='black')
+plt.plot(Idirr, tau, label='Direct Beam',ls='dashed',c='black')
 
-plt.plot(abs(J_mean_1[:]), pl/1e6, label='mean_1')
-plt.plot(abs(J_mean_2[:]), pl/1e6, label='mean_2')
+#plt.plot(abs(J_mean_1[:]), pl/1e6, label='mean_1')
+#plt.plot(abs(J_mean_2[:]), pl/1e6, label='mean_2')
+plt.plot(J_mean_1[:], (tau[1:nlev] + tau[0:nlay])/2.0, label='mean_1')
+plt.plot(J_mean_2[:], (tau[1:nlev] + tau[0:nlay])/2.0, label='mean_2')
 
 plt.legend()
 
