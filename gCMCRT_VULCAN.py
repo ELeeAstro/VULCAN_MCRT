@@ -20,12 +20,14 @@ pac_def = [
     ('zp', float64),
     ('tau_p', float64),
     ('tau', float64),
+    ('w', float64),
+    ('first', int32),
     ('iscat',int32),
 ]
 
 @jitclass(pac_def)
 class pac:
-  def __init__(self, flag, id, cost, nzp, zc, zp, tau_p, tau, iscat):
+  def __init__(self, flag, id, cost, nzp, zc, zp, tau_p, tau, w, first, iscat):
     self.flag = flag
     self.id = id
     self.cost = cost
@@ -34,10 +36,12 @@ class pac:
     self.zp = zp
     self.tau_p = tau_p
     self.tau = tau
+    self.w = w
+    self.first = first
     self.iscat = iscat
 
 @jit(nopython=True, cache=True)
-def tauint_1D_pp(ph, nlay, z, sig_ext, Jdot):
+def tauint_1D_pp(ph, nlay, z, sig_ext, l,  Jdot):
 
   ph.tau = 0.0
 
@@ -67,7 +71,7 @@ def tauint_1D_pp(ph, nlay, z, sig_ext, Jdot):
       ph.zp +=  d1 * ph.nzp
 
       # Update estimator
-      Jdot[ph.zc] += d1
+      Jdot[l,ph.zc] += d1 * ph.w
       #Jdot[ph.zc] += d1*ph.nzp
 
       ph.tau = ph.tau_p
@@ -76,7 +80,7 @@ def tauint_1D_pp(ph, nlay, z, sig_ext, Jdot):
       ph.zp += (dsz + 1.0e-12) * ph.nzp
 
       # Update estimator
-      Jdot[ph.zc] += dsz
+      Jdot[l,ph.zc] += dsz * ph.w
       #Jdot[ph.zc] += dsz*ph.nzp 
 
       ph.zc += zoffset
@@ -180,15 +184,46 @@ def scatter(ph, g):
 
   return
 
+@jit(nopython=True, cache=True)
+def scatter_surf(ph, z):
+    
+    ph.cost = np.sqrt(random())
+    ph.nzp = ph.cost
+    ph.zp = z[0] + 1.0e-12
+    ph.zc = 0
+
+    return
+
+@jit(nopython=True, cache=True)
+def path_stretch(ph, mu_z, tau):
+  
+  chi = 0.5
+
+  if (random() < chi):
+
+    tau_path = 10.0 #tau[0]/mu_z # Direct beam optical depth to surface
+
+    alpha = 1.0/(1.0 + tau_path)
+
+    ph.tau_p = -(np.log(random())/alpha)
+
+  else:
+
+    ph.tau_p = -np.log(random())
+
+  ph.w *= 1.0/((1.0 - chi) + chi*alpha*np.exp((1.0 - alpha) * ph.tau_p))
+  ph.first = 0
+
+  return
+
+
 @jit(nopython=True, cache=True, parallel=False)
-def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z):
+def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z):
   
   # We need to get sent the number of layers, wavelengths, cross sections, Rayleigh cross sections, 
   # atmospheric density, incident intensity TOA, altitude, zenith angle
 
   # We index from 0 starting from the bottom boundary 
-
-  Nph = 10000
 
   nlev = nlay + 1
 
@@ -196,16 +231,17 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
   dze = np.zeros(nlay)
   dze[:] = z[1:nlev] - z[0:nlay]
 
-  # Initalise arrays
-  tau = np.zeros(nlev)
-  sig_ext = np.zeros(nlay)
-  sig_sca = np.zeros(nlay)
-  alb = np.zeros(nlay)
+  # Initalise Jdot and Idirr arrays
   Jdot = np.zeros((nwl,nlay))
-  J_mean = np.zeros(nlay)
+  Idirr = np.zeros((nwl, nlev))
 
   # Wavelength loop
-  for l in range(nwl):
+  for l in prange(nwl):
+
+    tau = np.zeros(nlev)
+    sig_ext = np.zeros(nlay)
+    sig_sca = np.zeros(nlay)
+    alb = np.zeros(nlay)
 
     # Find the total extinction opacity from photocross sections
     for i in range(n_cross):
@@ -230,11 +266,7 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
     for k in range(nlay-1,-1,-1):
       tau[k] = tau[k+1] + sig_ext[k] * dze[k]
 
-    ## Calculate direct beam for testing
-    Idirr = np.zeros(nlev)
-    Idirr[:] = Iinc[l] * np.exp(-tau[:]/mu_z)
-
-    seed(l)
+    seed(int(1 + l**2 + int(np.sqrt(l))))
 
     e0dt =  mu_z * Iinc[l]/float(Nph)
 
@@ -243,10 +275,10 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
       # Initialise packet variables (janky python way)
       flag = 0
       id = l*Nph + n
-      iscat = 3
+      iscat = 2
 
       # Initialise photon packet with initial values
-      ph = pac(flag, id, 0.0, 0.0, 0, 0.0, 0.0, 0.0, iscat)
+      ph = pac(flag, id, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 1.0, 1, iscat)
 
       # Place photon at top of atmosphere with negative zenith angle
       inc_stellar(ph, nlay, z, mu_z)
@@ -254,11 +286,15 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
       # Scattering loop
       while(ph.flag == 0):
 
-        # Sample a random optical depth of the photon
-        ph.tau_p = -np.log(random())
+        if (ph.first == 1):
+          path_stretch(ph, mu_z, tau)
+          #print(ph.tau_p, ph.w)
+        else:
+          # Sample a random optical depth of the photon
+          ph.tau_p = -np.log(random())
 
         # Move the photon through the grid given by the sampled tau
-        tauint_1D_pp(ph, nlay, z, sig_ext, Jdot[l,:])
+        tauint_1D_pp(ph, nlay, z, sig_ext, l, Jdot)
 
         # Check status of the photon after moving
         match ph.flag:
@@ -282,63 +318,18 @@ def gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g
 
     # Scale estimator to dze
     Jdot[l,:] = (e0dt*Jdot[l,:])/dze[:]
+    ## Calculate direct beam for testing
+    Idirr[l,:] = Iinc[l] * np.exp(-tau[:]/mu_z)
 
 
-  # After all loops, integrate to find k for each cross section species and find integrated mean intensity
-  #for k in range(nlay):
-  #  J_mean[k] = np.trapz(Jdot[:,l], wl[:]) 
-  J_mean[:] = Jdot[0,:]
 
-  return J_mean, Jdot, Idirr, tau
-
-###
-
-# Possible future function updates for code
-
-# @jit(nopython=True, cache=True)
-# def scatter_surf(ph, z):
-    
-#     ph.cost = np.sqrt(random())
-#     ph.nzp = ph.cost
-#     ph.zp = z[0] + 1.0e-12
-#     ph.zc = 0
-
-#     return
-
-###
-
-###
-
-# @jit(nopython=True, cache=True)
-# def path_stretch(ph, mu_z, tau):
-  
-#   chi = 0.0
-
-#   if (random() < chi):
-
-#     tau_path = tau[0]/mu_z # Direct beam optical depth to surface
-
-#     alpha = 1.0/(1.0 + tau_path)
-
-#     ph.tau_p = -np.log(random()/alpha)/alpha
-
-#   else:
-
-#     ph.tau_p = -np.log(random())
-
-
-#   ph.w *= 1.0/((1.0 - chi) + chi*alpha*np.exp((1.0 - alpha) * ph.tau_p))
-#   ph.first = 0
-
-#   return
-
-###
+  return Jdot, Idirr
 
 ## Mini testing code ##
 
 nlay = 100
 nlev = nlay + 1
-nwl = 1
+nwl = 10
 n_cross = 1
 cross = np.zeros((n_cross,nwl,nlay))
 VMR_cross = np.zeros((n_cross, nlay))
@@ -349,8 +340,6 @@ g = np.zeros((nwl,nlay))
 rho = np.zeros(nlay)
 nd = np.zeros(nlay)
 Iinc = np.zeros(nwl)
-wl = np.zeros(nwl)
-surf_alb = np.zeros(nwl)
 
 
 mu_z = 0.577
@@ -382,44 +371,34 @@ z = np.zeros(nlev)
 rho[:] = pl[:]/(Rd_gas * Tl[:])
 nd[:] = pl[:]/(kb * Tl[:])
 
-VMR_cross[:,:] = 1.0
-cross[0,0,:] = k_v * rho[:]/ nd[:]
-
-VMR_ray[:,:] = 1.0
-ray[0,0,:] = 0.0 #*cross[0,0,:]
 
 z[0] = 0.0
 for i in range(nlay):
   z[i+1] = z[i] + Rd_gas/grav_const * Tl[i] * np.log(pe[i]/pe[i+1])
 
-g[:,:] = 0.9
 
-J_mean_1 = np.zeros(nlay)
-Jdot = np.zeros((nwl, nlay))
-
-tau = np.zeros(nlev)
-
-J_mean_1, Jdot, Idirr, tau, = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z)
-
+Nph = 10000
 
 VMR_ray[:,:] = 1.0
-ray[0,0,:] = 0.9*cross[0,0,:]
-cross[0,0,:] = cross[0,0,:] - ray[0,0,:]
+VMR_cross[:,:] = 1.0
+cross[0,:,:] = k_v * rho[:]/ nd[:]
+for l in range(nwl):
+  print(float(l)/float(nwl))
+  ray[0,l,:] = float(l)/float(nwl)*cross[0,l,:]
+  cross[0,l,:] = cross[0,l,:] - ray[0,l,:]
+  g[l,:] = 0.0
 
-J_mean_2 = np.zeros(nlay)
-J_mean_2, Jdot, Idirr, tau, = gCMCRT_main(nlay, nwl, wl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z)
+Jdot, Idirr = gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z)
 
 
 import matplotlib.pylab as plt
 
 fig = plt.figure()
 
-plt.plot(Idirr, tau, label='Direct Beam',ls='dashed',c='black')
 
-#plt.plot(abs(J_mean_1[:]), pl/1e6, label='mean_1')
-#plt.plot(abs(J_mean_2[:]), pl/1e6, label='mean_2')
-plt.plot(J_mean_1[:], (tau[1:nlev] + tau[0:nlay])/2.0, label='mean_1')
-plt.plot(J_mean_2[:], (tau[1:nlev] + tau[0:nlay])/2.0, label='mean_2')
+for l in range(nwl):
+  plt.plot(Idirr[l,:], pe,ls='dashed',c='black')
+  plt.plot(Jdot[l,:], pl, label='Jdot' + str(float(l)/float(nwl)))
 
 plt.legend()
 
