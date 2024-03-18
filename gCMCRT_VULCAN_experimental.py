@@ -22,13 +22,15 @@ pac_def = [
     ('zp', float64),
     ('tau_p', float64),
     ('tau', float64),
+    ('w', float64),
+    ('first', int32),
     ('iscat',int32),
 ]
 
 ## Class that defines packet properties
 @jitclass(pac_def)
 class pac:
-  def __init__(self, flag, id, cost, nzp, zc, zp, tau_p, tau, iscat):
+  def __init__(self, flag, id, cost, nzp, zc, zp, tau_p, tau, w, first, iscat):
     self.flag = flag
     self.id = id
     self.cost = cost
@@ -37,6 +39,8 @@ class pac:
     self.zp = zp
     self.tau_p = tau_p
     self.tau = tau
+    self.w = w
+    self.first = first
     self.iscat = iscat
 
 ## Function that integrates a packet through the 1D plane-parallel grid
@@ -74,7 +78,7 @@ def tauint_1D_pp(ph, nlay, z, sig_ext, l, Jdot):
       ph.zp +=  d1 * ph.nzp
 
       # Update estimator
-      Jdot[l,ph.zc] += d1 # Mean intensity estimator
+      Jdot[l,ph.zc] += d1 * ph.w # Mean intensity estimator
       #Jdot[l,ph.zc] += d1*ph.nzp # Flux estimator
 
       # tau of packet is now the sampled tau
@@ -85,7 +89,7 @@ def tauint_1D_pp(ph, nlay, z, sig_ext, l, Jdot):
       ph.zp += (dsz + 1.0e-12) * ph.nzp
 
       # Update estimator
-      Jdot[l,ph.zc] += dsz # Mean intensity estimator
+      Jdot[l,ph.zc] += dsz * ph.w # Mean intensity estimator
       #Jdot[l,ph.zc] += dsz*ph.nzp  # Flux estimator
 
       # Apply integer offset to cell number
@@ -207,6 +211,30 @@ def scatter_surf(ph, z):
 
     return
 
+## Function to produce path length stretching to packets (experimental)
+@jit(nopython=True, cache=True)
+def path_stretch(ph, mu_z, tau):
+  
+  # Biasing factor
+  chi = 0.5
+
+  if (random() < chi):
+
+    tau_path = tau[0]/mu_z # Direct beam optical depth to surface
+
+    alpha = 1.0/(1.0 + tau_path) # Alpha parameter
+
+    ph.tau_p = -(np.log(random())/alpha) # Sampled tau for path length stretching
+
+  else:
+
+    ph.tau_p = -np.log(random()) # Regular exponential sampling
+
+  ph.w *= 1.0/((1.0 - chi) + chi*alpha*np.exp((1.0 - alpha) * ph.tau_p)) # Weight adjustment for biasing
+  ph.first = 0 # Remove first flag
+
+  return
+
 ## Main gCMCRT function for wavelength and packet loop
 @jit(nopython=True, cache=True, parallel=False)
 def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, surf_alb, mu_z, z):
@@ -275,13 +303,19 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
       iscat = 2
 
       # Initialise photon packet with initial values
-      ph = pac(flag, id, 0.0, 0.0, 0, 0.0, 0.0, 0.0, iscat)
+      ph = pac(flag, id, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 1.0, 1, iscat)
 
       # Place photon at top of atmosphere with negative zenith angle
       inc_stellar(ph, nlay, z, mu_z)
 
       # Scattering loop
       while(ph.flag == 0):
+
+        # Path length stretching experiment
+        #if (ph.first == 1):
+        #  path_stretch(ph, mu_z, tau)
+          #print(ph.tau_p, ph.w)
+        #else:
 
         # Sample a random optical depth of the photon
         ph.tau_p = -np.log(random())
