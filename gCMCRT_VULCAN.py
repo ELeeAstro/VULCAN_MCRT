@@ -25,6 +25,7 @@ pac_def = [
     ('iscat',int32),
 ]
 
+## Class that defines packet properties
 @jitclass(pac_def)
 class pac:
   def __init__(self, flag, id, cost, nzp, zc, zp, tau_p, tau, w, first, iscat):
@@ -40,77 +41,89 @@ class pac:
     self.first = first
     self.iscat = iscat
 
+## Function that integrates a packet through the 1D plane-parallel grid
 @jit(nopython=True, cache=True)
-def tauint_1D_pp(ph, nlay, z, sig_ext, l,  Jdot):
+def tauint_1D_pp(ph, nlay, z, sig_ext, l, Jdot):
 
+  # Initial tau is at zero
   ph.tau = 0.0
 
   while (ph.tau < ph.tau_p):
 
-    #Calculate dsz, the distance to the next vertical level
+    # Calculate dsz, the distance to the next vertical level
     if (ph.nzp > 0.0):
         # Packet travelling upward, find distance to upper level
       dsz = (z[ph.zc+1]-ph.zp)/ph.nzp
       zoffset = 1
     elif (ph.nzp < 0.0):
-        #Packet travelling downward, find distance to lower level
+        # Packet traveling downward, find distance to lower level
       dsz = (z[ph.zc]-ph.zp)/ph.nzp
       zoffset = -1
     else:
-      #Packet travelling directly in z plane
-      #Return, packet does not move in z direction
+      # Packet traveling directly in z plane
+      # Return, packet does not move in z direction
       break
     
-    #Calculate optical depth to level
+    # Calculate optical depth to level edge
     taucell = dsz * sig_ext[ph.zc]
 
     # Check if packet ends path in this layer
     if ((ph.tau + taucell) >= ph.tau_p):
+
       # Packet stops in this cell - move distance then exit loop
       d1 = (ph.tau_p-ph.tau)/sig_ext[ph.zc]
       ph.zp +=  d1 * ph.nzp
 
       # Update estimator
-      Jdot[l,ph.zc] += d1 * ph.w
-      #Jdot[ph.zc] += d1*ph.nzp
+      Jdot[l,ph.zc] += d1 * ph.w # Mean intensity estimator
+      #Jdot[l,ph.zc] += d1*ph.nzp # Flux estimator
 
+      # tau of packet is now the sampled tau
       ph.tau = ph.tau_p
     else:
+
       #Packet continues to level edge - update position, cell index and tau
       ph.zp += (dsz + 1.0e-12) * ph.nzp
 
       # Update estimator
-      Jdot[l,ph.zc] += dsz * ph.w
-      #Jdot[ph.zc] += dsz*ph.nzp 
+      Jdot[l,ph.zc] += dsz * ph.w # Mean intensity estimator
+      #Jdot[l,ph.zc] += dsz*ph.nzp  # Flux estimator
 
+      # Apply integer offset to cell number
       ph.zc += zoffset
 
+      # Add tau of cell to tau counter of packet
       ph.tau += taucell
 
-      #Check is packet has exited the domain
+      # Check is packet has exited the domain
       if ((ph.zc > nlay-1) or (ph.zp >= z[-1])):
+        # Packet has exited the domain at the top of atmosphere
         ph.flag = 1
         break
       elif((ph.zc < 0) or (ph.zp <= z[0])):
+        # Packet has hit the lower part od the domain (surface)
         ph.flag = -2
         break
 
   return
 
+## Function for incident stellar radiation properties
 @jit(nopython=True, cache=True)
 def inc_stellar(ph, nlay, z, mu_z):
 
-  ph.cost = -mu_z
-  ph.nzp = ph.cost
-  ph.zc = nlay-1
-  ph.zp = z[-1] - 1.0e-12
+  ph.cost = -mu_z   # Initial direction is zenith angle
+  ph.nzp = ph.cost  # give nzp cost
+  ph.zc = nlay-1    # Initial layer number is top of atmosphere
+  ph.zp = z[-1] - 1.0e-12 # Initial position is topic atmosphere minus a little bit
 
   return
 
+## Function to scatter a packet into a new direction
 @jit(nopython=True, cache=True)
 def scatter(ph, g):
 
-
+  # Find the type of scattering the packet undergoes 
+  # (1 = isotropic, 2 = Rayleigh, 3 = Henyey-Greenstein)
   match ph.iscat:
 
     case 1:
@@ -184,48 +197,49 @@ def scatter(ph, g):
 
   return
 
+## Function to scatter from a surface (Assumed Lambertian)
 @jit(nopython=True, cache=True)
 def scatter_surf(ph, z):
     
-    ph.cost = np.sqrt(random())
-    ph.nzp = ph.cost
-    ph.zp = z[0] + 1.0e-12
-    ph.zc = 0
+    ph.cost = np.sqrt(random()) # Sample cosine from Lambertain cosine law
+    ph.nzp = ph.cost            # Give nzp cost value
+    ph.zc = 0                   # Initial layer is lowest (0)
+    ph.zp = z[0] + 1.0e-12      # Initial position is lowest altitude plus a little bit
 
     return
 
+## Function to produce path length stretching to packets (experimental)
 @jit(nopython=True, cache=True)
 def path_stretch(ph, mu_z, tau):
   
+  # Biasing factor
   chi = 0.5
 
   if (random() < chi):
 
-    tau_path = 10.0 #tau[0]/mu_z # Direct beam optical depth to surface
+    tau_path = tau[0]/mu_z # Direct beam optical depth to surface
 
-    alpha = 1.0/(1.0 + tau_path)
+    alpha = 1.0/(1.0 + tau_path) # Alpha parameter
 
-    ph.tau_p = -(np.log(random())/alpha)
+    ph.tau_p = -(np.log(random())/alpha) # Sampled tau for path length stretching
 
   else:
 
-    ph.tau_p = -np.log(random())
+    ph.tau_p = -np.log(random()) # Regular exponential sampling
 
-  ph.w *= 1.0/((1.0 - chi) + chi*alpha*np.exp((1.0 - alpha) * ph.tau_p))
-  ph.first = 0
+  ph.w *= 1.0/((1.0 - chi) + chi*alpha*np.exp((1.0 - alpha) * ph.tau_p)) # Weight adjustment for biasing
+  ph.first = 0 # Remove first flag
 
   return
 
-
+## Main gCMCRT function for wavelength and packet loop
 @jit(nopython=True, cache=True, parallel=False)
-def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z):
+def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, surf_alb, mu_z, z):
   
-  # We need to get sent the number of layers, wavelengths, cross sections, Rayleigh cross sections, 
-  # atmospheric density, incident intensity TOA, altitude, zenith angle
 
   # We index from 0 starting from the bottom boundary 
 
-  nlev = nlay + 1
+  nlev = nlay + 1 # Number of levels
 
   # Find altitude difference of level edges
   dze = np.zeros(nlay)
@@ -235,9 +249,13 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
   Jdot = np.zeros((nwl,nlay))
   Idirr = np.zeros((nwl, nlev))
 
-  # Wavelength loop
+  # Initialise packet energy array
+  e0dt = np.zeros(nwl)
+
+  # Wavelength loop (can be parallel with prange)
   for l in prange(nwl):
 
+    # Working arrays
     tau = np.zeros(nlev)
     sig_ext = np.zeros(nlay)
     sig_sca = np.zeros(nlay)
@@ -247,13 +265,13 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
     for i in range(n_cross):
       sig_ext[:] += VMR_cross[i,:] * cross[i,l,:]
     
-    sig_ext[:] *= nd[:]
+    sig_ext[:] *= nd[:] # Absorption opacity [cm-1]
 
     # Find the total rayleigh opacity from Rayleigh species cross sections
     for i in range(n_ray):
       sig_sca[:] += VMR_ray[i,:] * ray[i,l,:]
 
-    sig_sca[:] *= nd[:]
+    sig_sca[:] *= nd[:] # Scattering opacity [cm-1]
 
     # Extinction = photocross + Rayleigh
     sig_ext[:] += sig_sca[:]
@@ -266,10 +284,13 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
     for k in range(nlay-1,-1,-1):
       tau[k] = tau[k+1] + sig_ext[k] * dze[k]
 
+    # Initialse random seed for this wavelength 
     seed(int(1 + l**2 + int(np.sqrt(l))))
 
-    e0dt =  mu_z * Iinc[l]/float(Nph)
-
+    # Energy carried by each packet for this wavelength
+    e0dt[l] =  mu_z * Iinc[l]/float(Nph)
+ 
+    # Packet number loop
     for n in range(Nph):
 
       # Initialise packet variables (janky python way)
@@ -286,12 +307,14 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
       # Scattering loop
       while(ph.flag == 0):
 
-        if (ph.first == 1):
-          path_stretch(ph, mu_z, tau)
+        # Path length stretching experiment
+        #if (ph.first == 1):
+        #  path_stretch(ph, mu_z, tau)
           #print(ph.tau_p, ph.w)
-        else:
-          # Sample a random optical depth of the photon
-          ph.tau_p = -np.log(random())
+        #else:
+
+        # Sample a random optical depth of the photon
+        ph.tau_p = -np.log(random())
 
         # Move the photon through the grid given by the sampled tau
         tauint_1D_pp(ph, nlay, z, sig_ext, l, Jdot)
@@ -302,8 +325,13 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
             # Photon exited top of atmosphere, exit loop
             break
           case -2: 
-            # Photon was absorbed by surface, exit loop
-            break
+            # Photon hit surface surface, test surface albedo
+            if (random() < surf_alb[l]):
+              # Packet scattered off surface (Lambertian assumed)
+              scatter_surf(ph, z)
+            else:
+              # Packet was absorbed by the surface
+              break
           case 0:
             # Photon still in grid, test atmospheric albedo
             if (random() < alb[ph.zc]):
@@ -316,12 +344,10 @@ def gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, 
             # Photon has an invalid flag, raise error
             print(str(ph.id) + ' has invalid flag: ' + str(ph.flag))
 
-    # Scale estimator to dze
-    Jdot[l,:] = (e0dt*Jdot[l,:])/dze[:]
+    ## Scale estimator to dze
+    Jdot[l,:] = e0dt[l]*Jdot[l,:]/dze[:]
     ## Calculate direct beam for testing
     Idirr[l,:] = Iinc[l] * np.exp(-tau[:]/mu_z)
-
-
 
   return Jdot, Idirr
 
@@ -340,8 +366,8 @@ g = np.zeros((nwl,nlay))
 rho = np.zeros(nlay)
 nd = np.zeros(nlay)
 Iinc = np.zeros(nwl)
-
-
+surf_alb = np.zeros(nwl)
+ 
 mu_z = 0.577
 k_v = 4e-4
 p_up = 1e-9
@@ -388,7 +414,7 @@ for l in range(nwl):
   cross[0,l,:] = cross[0,l,:] - ray[0,l,:]
   g[l,:] = 0.0
 
-Jdot, Idirr = gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, mu_z, z)
+Jdot, Idirr = gCMCRT_main(Nph, nlay, nwl, n_cross, cross, VMR_cross, n_ray, ray, VMR_ray, g, nd, Iinc, surf_alb, mu_z, z)
 
 
 import matplotlib.pylab as plt
